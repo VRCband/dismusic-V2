@@ -1,4 +1,3 @@
-
 import asyncio
 import async_timeout
 import typing
@@ -25,7 +24,7 @@ from .paginator import Paginator
 from .player import DisPlayer
 
 
-class Music(commands.Cog):
+class MusicSlash(commands.Cog):
     """Music commands converted to slash commands (discord.py v2 app_commands)."""
 
     def __init__(self, bot: commands.Bot):
@@ -38,7 +37,7 @@ class Music(commands.Cog):
     async def _ensure_voice_for_user(
         self, interaction: discord.Interaction
     ) -> typing.Tuple[typing.Optional[DisPlayer], typing.Optional[discord.Member]]:
-        """Return (player, member.voice) or send an ephemeral error and return (None, None)."""
+        """Return (player, member) or send an ephemeral error and return (None, None)."""
         member = interaction.user
         if not isinstance(member, discord.Member):
             await interaction.response.send_message(
@@ -47,14 +46,42 @@ class Music(commands.Cog):
             return None, None
 
         vc = member.voice
-        player = interaction.guild.voice_client
         if not vc:
             await interaction.response.send_message(
                 "You must be in a voice channel to use this command.", ephemeral=True
             )
             return None, None
 
+        player = interaction.guild.voice_client
         return player, member
+
+    async def _do_connect(self, interaction: discord.Interaction) -> typing.Optional[DisPlayer]:
+        """Actual connect implementation (callable by other helpers)."""
+        member = interaction.user
+        if not isinstance(member, discord.Member) or member.guild is None:
+            await interaction.response.send_message("This command must be used in a guild.", ephemeral=True)
+            return None
+
+        channel = member.voice.channel if member.voice else None
+        if channel is None:
+            await interaction.response.send_message("You must be in a voice channel.", ephemeral=True)
+            return None
+
+        if interaction.guild.voice_client:
+            await interaction.response.send_message("Already connected.", ephemeral=True)
+            return interaction.guild.voice_client
+
+        await interaction.response.defer()
+        try:
+            player: DisPlayer = await channel.connect(cls=DisPlayer)
+            self.bot.dispatch("dismusic_player_connect", player)
+            player.bound_channel = interaction.channel
+            player.bot = self.bot
+            await interaction.followup.send(f"✅ Connected to `{channel.name}`")
+            return player
+        except (asyncio.TimeoutError, discord.ClientException):
+            await interaction.followup.send("Failed to connect to voice channel.")
+            return None
 
     async def play_track_interaction(
         self,
@@ -63,6 +90,7 @@ class Music(commands.Cog):
         provider: typing.Optional[str] = None,
     ):
         """Logic adapted from original play_track, using interaction for responses."""
+        # Ensure followups use defer/followup pattern
         await interaction.response.defer()
         player: DisPlayer = interaction.guild.voice_client
 
@@ -73,7 +101,8 @@ class Music(commands.Cog):
         # Ensure same voice channel
         member = interaction.user
         if member.voice is None or member.voice.channel.id != player.channel.id:
-            raise MustBeSameChannel("You must be in the same voice channel as the player.")
+            await interaction.followup.send("You must be in the same voice channel as the player.", ephemeral=True)
+            return
 
         track_providers = {
             "yt": YouTubeTrack,
@@ -86,7 +115,7 @@ class Music(commands.Cog):
         query = query.strip("<>")
         msg = await interaction.followup.send(f"Searching for `{query}` :mag_right:")
 
-        track_provider_key = provider if provider else player.track_provider
+        track_provider_key = provider if provider else getattr(player, "track_provider", None)
 
         # detect playlist url-ish
         if track_provider_key == "yt" and "playlist" in query:
@@ -95,7 +124,7 @@ class Music(commands.Cog):
         provider_cls = (
             track_providers.get(track_provider_key)
             if track_provider_key
-            else track_providers.get(player.track_provider)
+            else track_providers.get(getattr(player, "track_provider", "yt"))
         )
 
         nodes = self.get_nodes()
@@ -103,7 +132,7 @@ class Music(commands.Cog):
 
         for node in nodes:
             try:
-                with async_timeout.timeout(20):
+                async with async_timeout.timeout(20):
                     tracks = await provider_cls.search(query, node=node)
                     break
             except asyncio.TimeoutError:
@@ -149,32 +178,10 @@ class Music(commands.Cog):
                     f"[dismusic] ERROR - Failed to create node {config.get('host')}:{config.get('port')}"
                 )
 
-    # Connect
+    # Connect command wrapper
     @app_commands.command(name="connect", description="Connect the player to your voice channel")
     async def connect(self, interaction: discord.Interaction):
-        member = interaction.user
-        if not isinstance(member, discord.Member) or member.guild is None:
-            await interaction.response.send_message("This command must be used in a guild.", ephemeral=True)
-            return
-
-        channel = member.voice.channel if member.voice else None
-        if channel is None:
-            await interaction.response.send_message("You must be in a voice channel.", ephemeral=True)
-            return
-
-        if interaction.guild.voice_client:
-            await interaction.response.send_message("Already connected.", ephemeral=True)
-            return
-
-        await interaction.response.defer()
-        try:
-            player: DisPlayer = await channel.connect(cls=DisPlayer)
-            self.bot.dispatch("dismusic_player_connect", player)
-            player.bound_channel = interaction.channel
-            player.bot = self.bot
-            await interaction.followup.send(f"✅ Connected to `{channel.name}`")
-        except (asyncio.TimeoutError, discord.ClientException):
-            await interaction.followup.send("Failed to connect to voice channel.")
+        await self._do_connect(interaction)
 
     # Play group (uses subcommands for providers)
     play_group = app_commands.Group(name="play", description="Play or add a song to the queue")
@@ -187,7 +194,9 @@ class Music(commands.Cog):
             return
         # ensure connect if not connected
         if not player:
-            await self.connect(interaction)
+            player = await self._do_connect(interaction)
+            if not player:
+                return
         await self.play_track_interaction(interaction, query, provider=None)
 
     @play_group.command(name="youtube", description="Play a YouTube track")
@@ -197,7 +206,9 @@ class Music(commands.Cog):
         if player is None and member is None:
             return
         if not player:
-            await self.connect(interaction)
+            player = await self._do_connect(interaction)
+            if not player:
+                return
         await self.play_track_interaction(interaction, query, provider="yt")
 
     @play_group.command(name="ytmusic", description="Play a YouTube Music track")
@@ -207,7 +218,9 @@ class Music(commands.Cog):
         if player is None and member is None:
             return
         if not player:
-            await self.connect(interaction)
+            player = await self._do_connect(interaction)
+            if not player:
+                return
         await self.play_track_interaction(interaction, query, provider="ytmusic")
 
     @play_group.command(name="soundcloud", description="Play a SoundCloud track")
@@ -217,7 +230,9 @@ class Music(commands.Cog):
         if player is None and member is None:
             return
         if not player:
-            await self.connect(interaction)
+            player = await self._do_connect(interaction)
+            if not player:
+                return
         await self.play_track_interaction(interaction, query, provider="soundcloud")
 
     @play_group.command(name="spotify", description="Play a Spotify track")
@@ -227,7 +242,9 @@ class Music(commands.Cog):
         if player is None and member is None:
             return
         if not player:
-            await self.connect(interaction)
+            player = await self._do_connect(interaction)
+            if not player:
+                return
         await self.play_track_interaction(interaction, query, provider="spotify")
 
     # Volume
@@ -322,7 +339,7 @@ class Music(commands.Cog):
             await interaction.response.send_message("Player is not connected.", ephemeral=True)
             return
 
-        if player.loop == "CURRENT":
+        if getattr(player, "loop", None) == "CURRENT":
             player.loop = "NONE"
 
         await player.stop()
@@ -341,7 +358,8 @@ class Music(commands.Cog):
         if player and player.is_playing():
             old_position = player.position
             position = old_position + seconds
-            if position > getattr(player.source, "length", 0):
+            track_length = getattr(getattr(player, "source", None), "length", 0)
+            if position > track_length:
                 await interaction.response.send_message("Can't seek past the end of the track.", ephemeral=True)
                 return
 
@@ -379,11 +397,13 @@ class Music(commands.Cog):
             return
 
         player = interaction.guild.voice_client
-        if not player or len(getattr(player.queue._queue, "__len__", lambda: 0)()) < 1:
+        queue_len = len(getattr(getattr(player, "queue", None), "_queue", ()))
+        if not player or queue_len < 1:
             await interaction.response.send_message("Nothing is in the queue.", ephemeral=True)
             return
 
         await interaction.response.defer()
+        # Paginator must accept an Interaction; if your Paginator expects Context, adapt accordingly.
         paginator = Paginator(interaction, player)
         await paginator.start()
 
@@ -399,12 +419,12 @@ class Music(commands.Cog):
             await interaction.response.send_message("Player is not connected.", ephemeral=True)
             return
 
+        # Ensure DisPlayer.invoke_player accepts Interaction; adapt if necessary.
         await player.invoke_player(interaction)
 
     # Setup loader for cog
     @classmethod
     async def cog_load(cls):
-        # Nothing special to do; commands are registered when cog is added
         return
 
     @classmethod
