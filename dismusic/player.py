@@ -22,8 +22,14 @@ class DisPlayer(Player):
     async def destroy(self) -> None:
         self.queue = None
 
-        await super().stop()
-        await super().disconnect()
+        # wavelink Player.stop / disconnect may be sync or async depending on version.
+        res = super().stop()
+        if asyncio.iscoroutine(res):
+            await res
+
+        res = super().disconnect()
+        if asyncio.iscoroutine(res):
+            await res
 
     async def do_next(self) -> None:
         if self.is_playing():
@@ -32,7 +38,8 @@ class DisPlayer(Player):
         timeout = int(os.getenv("DISMUSIC_TIMEOUT", 300))
 
         try:
-            with async_timeout.timeout(timeout):
+            # use async context manager for async_timeout
+            async with async_timeout.timeout(timeout):
                 track = await self.queue.get()
         except asyncio.TimeoutError:
             if not self.is_playing():
@@ -40,10 +47,21 @@ class DisPlayer(Player):
 
             return
 
+        # store source and play
         self._source = track
         await self.play(track)
-        self.client.dispatch("dismusic_track_start", self, track)
-        await self.invoke_player()
+        # dispatch track start event
+        try:
+            self.client.dispatch("dismusic_track_start", self, track)
+        except Exception:
+            # best-effort; don't crash if dispatch fails
+            pass
+
+        # show now playing in bound channel
+        try:
+            await self.invoke_player()
+        except Exception:
+            pass
 
     async def set_loop(self, loop_type: str) -> None:
         if not self.is_playing():
@@ -109,6 +127,10 @@ class DisPlayer(Player):
             embed.add_field(name="Next Song", value=next_song, inline=False)
 
         if not ctx:
-            return await self.bound_channel.send(embed=embed)
+            # send to bound channel if available
+            if self.bound_channel:
+                return await self.bound_channel.send(embed=embed)
+            # fallback to do nothing if no bound channel
+            return
 
         await ctx.send(embed=embed)
