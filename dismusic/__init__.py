@@ -16,6 +16,6 @@ from .events import MusicEvents
 from .music import Music
 
 
-def setup(bot):
-    bot.add_cog(Music(bot))
-    bot.add_cog(MusicEvents(bot))
+async def setup(bot):
+    await bot.add_cog(Music(bot))
+    await bot.add_cog(MusicEvents(bot))
