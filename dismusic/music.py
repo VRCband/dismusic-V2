@@ -55,8 +55,8 @@ class Music(commands.Cog):
         player = interaction.guild.voice_client
         return player, member
 
-    async def _do_connect(self, interaction: discord.Interaction) -> typing.Optional[DisPlayer]:
-        """Actual connect implementation (callable by other helpers)."""
+    async def _connect(self, interaction: discord.Interaction) -> typing.Optional[DisPlayer]:
+        """Callable connect helper; returns the connected DisPlayer or None."""
         member = interaction.user
         if not isinstance(member, discord.Member) or member.guild is None:
             await interaction.response.send_message("This command must be used in a guild.", ephemeral=True)
@@ -71,7 +71,10 @@ class Music(commands.Cog):
             await interaction.response.send_message("Already connected.", ephemeral=True)
             return interaction.guild.voice_client
 
-        await interaction.response.defer()
+        # Defer so we can follow up with messages
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+
         try:
             player: DisPlayer = await channel.connect(cls=DisPlayer)
             self.bot.dispatch("dismusic_player_connect", player)
@@ -89,9 +92,11 @@ class Music(commands.Cog):
         query: str,
         provider: typing.Optional[str] = None,
     ):
-        """Logic adapted from original play_track, using interaction for responses."""
-        # Ensure followups use defer/followup pattern
-        await interaction.response.defer()
+        """Play logic adapted from original play_track, using interaction for responses."""
+        # Defer only if not yet responded
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+
         player: DisPlayer = interaction.guild.voice_client
 
         if not player:
@@ -113,6 +118,7 @@ class Music(commands.Cog):
         }
 
         query = query.strip("<>")
+        # send initial searching message via followup to allow editing later
         msg = await interaction.followup.send(f"Searching for `{query}` :mag_right:")
 
         track_provider_key = provider if provider else getattr(player, "track_provider", None)
@@ -156,7 +162,9 @@ class Music(commands.Cog):
             await msg.edit(content=f"Added `{track.title}` to queue.")
             await player.queue.put(track)
 
+        # player.do_next is expected to be awaitable
         if not player.is_playing():
+            # ensure do_next is awaited; do_next in player.py must be async
             await player.do_next()
 
     async def start_nodes(self):
@@ -178,12 +186,13 @@ class Music(commands.Cog):
                     f"[dismusic] ERROR - Failed to create node {config.get('host')}:{config.get('port')}"
                 )
 
-    # Connect command wrapper
+    # --- Slash command wrappers and group ---
+
     @app_commands.command(name="connect", description="Connect the player to your voice channel")
     async def connect(self, interaction: discord.Interaction):
-        await self._do_connect(interaction)
+        await self._connect(interaction)
 
-    # Play group (uses subcommands for providers)
+    # Play group
     play_group = app_commands.Group(name="play", description="Play or add a song to the queue")
 
     @play_group.command(name="query", description="Play or add a song (default: YouTube)")
@@ -192,9 +201,8 @@ class Music(commands.Cog):
         player, member = await self._ensure_voice_for_user(interaction)
         if player is None and member is None:
             return
-        # ensure connect if not connected
         if not player:
-            player = await self._do_connect(interaction)
+            player = await self._connect(interaction)
             if not player:
                 return
         await self.play_track_interaction(interaction, query, provider=None)
@@ -206,7 +214,7 @@ class Music(commands.Cog):
         if player is None and member is None:
             return
         if not player:
-            player = await self._do_connect(interaction)
+            player = await self._connect(interaction)
             if not player:
                 return
         await self.play_track_interaction(interaction, query, provider="yt")
@@ -218,7 +226,7 @@ class Music(commands.Cog):
         if player is None and member is None:
             return
         if not player:
-            player = await self._do_connect(interaction)
+            player = await self._connect(interaction)
             if not player:
                 return
         await self.play_track_interaction(interaction, query, provider="ytmusic")
@@ -230,7 +238,7 @@ class Music(commands.Cog):
         if player is None and member is None:
             return
         if not player:
-            player = await self._do_connect(interaction)
+            player = await self._connect(interaction)
             if not player:
                 return
         await self.play_track_interaction(interaction, query, provider="soundcloud")
@@ -242,12 +250,11 @@ class Music(commands.Cog):
         if player is None and member is None:
             return
         if not player:
-            player = await self._do_connect(interaction)
+            player = await self._connect(interaction)
             if not player:
                 return
         await self.play_track_interaction(interaction, query, provider="spotify")
 
-    # Volume
     @app_commands.command(name="volume", description="Set player volume (0-100)")
     @app_commands.describe(vol="Volume percent (0-100)", forced="Force volume greater than 100")
     async def volume(self, interaction: discord.Interaction, vol: int, forced: bool = False):
@@ -271,7 +278,6 @@ class Music(commands.Cog):
         await player.set_volume(vol)
         await interaction.response.send_message(f"Volume set to {vol} :loud_sound:")
 
-    # Stop / disconnect
     @app_commands.command(name="stop", description="Stop and disconnect the player")
     async def stop(self, interaction: discord.Interaction):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -287,7 +293,6 @@ class Music(commands.Cog):
         await interaction.response.send_message("Stopped the player :stop_button:")
         self.bot.dispatch("dismusic_player_stop", player)
 
-    # Pause
     @app_commands.command(name="pause", description="Pause the player")
     async def pause(self, interaction: discord.Interaction):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -307,7 +312,6 @@ class Music(commands.Cog):
 
         await interaction.response.send_message("Player is not playing anything.", ephemeral=True)
 
-    # Resume
     @app_commands.command(name="resume", description="Resume the player")
     async def resume(self, interaction: discord.Interaction):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -327,7 +331,6 @@ class Music(commands.Cog):
 
         await interaction.response.send_message("Player is not playing anything.", ephemeral=True)
 
-    # Skip
     @app_commands.command(name="skip", description="Skip to the next song in the queue")
     async def skip(self, interaction: discord.Interaction):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -346,7 +349,6 @@ class Music(commands.Cog):
         self.bot.dispatch("dismusic_track_skip", player)
         await interaction.response.send_message("Skipped :track_next:")
 
-    # Seek (seconds)
     @app_commands.command(name="seek", description="Seek the player forward/backward by seconds")
     @app_commands.describe(seconds="Seconds to advance (positive) or rewind (negative)")
     async def seek(self, interaction: discord.Interaction, seconds: int):
@@ -373,7 +375,6 @@ class Music(commands.Cog):
 
         await interaction.response.send_message("Player is not playing anything.", ephemeral=True)
 
-    # Loop
     @app_commands.command(name="loop", description="Set loop mode: NONE, CURRENT, PLAYLIST")
     @app_commands.describe(loop_type="NONE, CURRENT, or PLAYLIST")
     async def loop(self, interaction: discord.Interaction, loop_type: str = None):
@@ -389,7 +390,6 @@ class Music(commands.Cog):
         result = await player.set_loop(loop_type)
         await interaction.response.send_message(f"Loop has been set to {result} :repeat:")
 
-    # Queue (uses paginator)
     @app_commands.command(name="queue", description="Show the player queue")
     async def queue(self, interaction: discord.Interaction):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -402,12 +402,11 @@ class Music(commands.Cog):
             await interaction.response.send_message("Nothing is in the queue.", ephemeral=True)
             return
 
-        await interaction.response.defer()
-        # Paginator must accept an Interaction; if your Paginator expects Context, adapt accordingly.
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         paginator = Paginator(interaction, player)
         await paginator.start()
 
-    # Now playing
     @app_commands.command(name="nowplaying", description="Show the currently playing song")
     async def nowplaying(self, interaction: discord.Interaction):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -419,19 +418,18 @@ class Music(commands.Cog):
             await interaction.response.send_message("Player is not connected.", ephemeral=True)
             return
 
-        # Ensure DisPlayer.invoke_player accepts Interaction; adapt if necessary.
         await player.invoke_player(interaction)
 
-    # Setup loader for cog
+    # Setup loader for cog (class-based)
     @classmethod
     async def cog_load(cls):
         return
 
     @classmethod
     async def setup(cls, bot: commands.Bot):
-        await bot.add_cog(MusicSlash(bot))
+        await bot.add_cog(Music(bot))
 
 
 # Module-level setup for discord.ext.commands extension loading
 async def setup(bot: commands.Bot):
-    await bot.add_cog(MusicSlash(bot))
+    await bot.add_cog(Music(bot))
