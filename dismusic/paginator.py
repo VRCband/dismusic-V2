@@ -1,7 +1,7 @@
 import asyncio
 import math
 
-from discord import (Color, Embed, Forbidden, HTTPException, InvalidArgument,
+from discord import (Color, Embed, Forbidden, HTTPException,
                      NotFound)
 
 from ._classes import Emojis, Loop
@@ -83,7 +83,7 @@ class Paginator:
                     await msg.add_reaction(Emojis.PREV)
                     await msg.add_reaction(Emojis.NEXT)
                     await msg.add_reaction(Emojis.LAST)
-                except (HTTPException, Forbidden, NotFound, InvalidArgument) as e:
+                except (HTTPException, Forbidden, NotFound) as e:
                     print(e)
                     pass
             else:
