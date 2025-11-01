@@ -24,7 +24,7 @@ from .paginator import Paginator
 from .player import DisPlayer
 
 
-class MusicSlash(commands.Cog):
+class Music(commands.Cog):
     """Music commands converted to slash commands (discord.py v2 app_commands)."""
 
     def __init__(self, bot: commands.Bot):
