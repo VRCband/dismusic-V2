@@ -1,22 +1,27 @@
 import asyncio
-import async_timeout
-import typing
+import tempfile
+import os
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Tuple, Dict
 
+import aiohttp
+import yt_dlp
 import wavelink
 from wavelink import (
     LavalinkException,
     LoadTrackError,
-    SoundCloudTrack,
-    YouTubeMusicTrack,
     YouTubePlaylist,
     YouTubeTrack,
+    YouTubeMusicTrack,
+    SoundCloudTrack,
 )
-from wavelink.ext import spotify
 from wavelink.ext.spotify import SpotifyTrack
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+import async_timeout
 
 from ._classes import Provider
 from .errors import MustBeSameChannel
@@ -24,39 +29,156 @@ from .paginator import Paginator
 from .player import DisPlayer
 
 
-class Music(commands.Cog):
-    """Music commands converted to slash commands (discord.py v2 app_commands)."""
+# --- yt-dlp helpers (sync worker + chooser) ---
 
-    def __init__(self, bot: commands.Bot):
+
+def _ydl_extract_sync(url_or_query: str, cookiefile: Optional[str] = None, ytdl_opts: Optional[dict] = None) -> Dict:
+    opts = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "nocheckcertificate": True,
+        "source_address": "0.0.0.0",
+    }
+    if ytdl_opts:
+        opts.update(ytdl_opts)
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url_or_query, download=False)
+    return info
+
+
+def _choose_audio_url_from_info(info: Dict) -> Optional[Tuple[str, Dict]]:
+    if not info:
+        return None
+
+    # If search/playlist returned entries, pick the first
+    if "entries" in info and info["entries"]:
+        entry = info["entries"][0]
+    else:
+        entry = info
+
+    # direct 'url' present and not a live stream
+    if entry.get("url") and not entry.get("is_live", False):
+        return entry["url"], entry
+
+    formats = entry.get("formats") or []
+    audio_formats = [f for f in formats if f.get("acodec") != "none"]
+    if not audio_formats:
+        return None
+
+    best = sorted(audio_formats, key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0), reverse=True)[0]
+    return best.get("url"), entry
+
+
+# --- Music cog ---
+
+
+class Music(commands.Cog):
+    """
+    Music cog with:
+    - guarded interaction.defer usage
+    - yt-dlp fallback using cookie gist raw URL (provided at setup)
+    - robust Lavalink node handling and async-timeout fixes
+    """
+
+    def __init__(self, bot: commands.Bot, *, cookie_gist_raw_url: Optional[str] = None):
         self.bot: commands.Bot = bot
+        self.cookie_gist_raw_url = cookie_gist_raw_url
         self.bot.loop.create_task(self.start_nodes())
+        self._ydl_executor = ThreadPoolExecutor(max_workers=2)
 
     def get_nodes(self):
         return sorted(wavelink.NodePool._nodes.values(), key=lambda n: len(n.players))
 
-    async def _ensure_voice_for_user(
-        self, interaction: discord.Interaction
-    ) -> typing.Tuple[typing.Optional[DisPlayer], typing.Optional[discord.Member]]:
-        """Return (player, member) or send an ephemeral error and return (None, None)."""
+    # --- cookie fetching / yt-dlp extraction ---
+
+    async def _fetch_cookies_text(self) -> Optional[str]:
+        if not self.cookie_gist_raw_url:
+            return None
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(self.cookie_gist_raw_url, timeout=10) as resp:
+                    if resp.status == 200:
+                        return await resp.text()
+        except Exception:
+            return None
+        return None
+
+    async def _extract_with_ytdlp(self, query: str, cookies_text: Optional[str] = None) -> Optional[Dict]:
+        loop = asyncio.get_event_loop()
+        tmp_cookie_path = None
+        try:
+            if cookies_text:
+                tf = tempfile.NamedTemporaryFile(delete=False, prefix="ytdlp_cookies_", suffix=".txt")
+                tf.write(cookies_text.encode("utf-8"))
+                tf.flush()
+                tf.close()
+                tmp_cookie_path = tf.name
+
+            info = await loop.run_in_executor(self._ydl_executor, _ydl_extract_sync, query, tmp_cookie_path, None)
+            return info
+        finally:
+            if tmp_cookie_path:
+                try:
+                    os.unlink(tmp_cookie_path)
+                except Exception:
+                    pass
+
+    async def play_via_ytdlp(self, player: DisPlayer, query: str) -> bool:
+        cookies_text = await self._fetch_cookies_text()
+        try:
+            info = await self._extract_with_ytdlp(query, cookies_text)
+        except Exception:
+            return False
+
+        chosen = _choose_audio_url_from_info(info)
+        if not chosen:
+            return False
+
+        direct_url, meta = chosen
+
+        # Try to play direct URL via player.play (wavelink handles HTTP streams)
+        try:
+            res = player.play(direct_url)
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception:
+            # Fallback: node.play if API/version requires it
+            try:
+                node = next(iter(wavelink.NodePool._nodes.values()))
+                await node.play(player.player_id, direct_url)
+            except Exception:
+                return False
+
+        # Attach metadata for now-playing display
+        try:
+            player._source = meta
+        except Exception:
+            pass
+
+        return True
+
+    # --- internal helpers for interactions/voice checks ---
+
+    async def _ensure_voice_for_user(self, interaction: discord.Interaction) -> Tuple[Optional[DisPlayer], Optional[discord.Member]]:
         member = interaction.user
         if not isinstance(member, discord.Member):
-            await interaction.response.send_message(
-                "Command must be used in a guild.", ephemeral=True
-            )
+            await interaction.response.send_message("This command must be used in a guild.", ephemeral=True)
             return None, None
 
         vc = member.voice
         if not vc:
-            await interaction.response.send_message(
-                "You must be in a voice channel to use this command.", ephemeral=True
-            )
+            await interaction.response.send_message("You must be in a voice channel to use this command.", ephemeral=True)
             return None, None
 
         player = interaction.guild.voice_client
         return player, member
 
-    async def _connect(self, interaction: discord.Interaction) -> typing.Optional[DisPlayer]:
-        """Callable connect helper; returns the connected DisPlayer or None."""
+    async def _connect(self, interaction: discord.Interaction) -> Optional[DisPlayer]:
         member = interaction.user
         if not isinstance(member, discord.Member) or member.guild is None:
             await interaction.response.send_message("This command must be used in a guild.", ephemeral=True)
@@ -71,7 +193,6 @@ class Music(commands.Cog):
             await interaction.response.send_message("Already connected.", ephemeral=True)
             return interaction.guild.voice_client
 
-        # Defer so we can follow up with messages
         if not interaction.response.is_done():
             await interaction.response.defer()
 
@@ -86,19 +207,14 @@ class Music(commands.Cog):
             await interaction.followup.send("Failed to connect to voice channel.")
             return None
 
-    async def play_track_interaction(
-        self,
-        interaction: discord.Interaction,
-        query: str,
-        provider: typing.Optional[str] = None,
-    ):
-        """Play logic adapted from original play_track, using interaction for responses."""
-        # Defer only if not yet responded
+    # --- main play workflow with fallback --- #
+
+    async def play_track_interaction(self, interaction: discord.Interaction, query: str, provider: Optional[str] = None):
+        # Defer only if not already responded
         if not interaction.response.is_done():
             await interaction.response.defer()
 
         player: DisPlayer = interaction.guild.voice_client
-
         if not player:
             await interaction.followup.send("Player is not connected. Use /connect first.")
             return
@@ -118,12 +234,9 @@ class Music(commands.Cog):
         }
 
         query = query.strip("<>")
-        # send initial searching message via followup to allow editing later
         msg = await interaction.followup.send(f"Searching for `{query}` :mag_right:")
 
         track_provider_key = provider if provider else getattr(player, "track_provider", None)
-
-        # detect playlist url-ish
         if track_provider_key == "yt" and "playlist" in query:
             track_provider_key = "ytpl"
 
@@ -136,6 +249,7 @@ class Music(commands.Cog):
         nodes = self.get_nodes()
         tracks = []
 
+        lavalink_requires_login = False
         for node in nodes:
             try:
                 async with async_timeout.timeout(20):
@@ -145,13 +259,28 @@ class Music(commands.Cog):
                 self.bot.dispatch("dismusic_node_fail", node)
                 wavelink.NodePool._nodes.pop(node.identifier, None)
                 continue
-            except (LavalinkException, LoadTrackError):
+            except (LavalinkException, LoadTrackError) as e:
+                txt = str(e).lower()
+                if "login" in txt or "requires login" in txt or "private" in txt:
+                    lavalink_requires_login = True
+                    break
                 continue
 
-        if not tracks:
+        if not tracks and not lavalink_requires_login:
             await msg.edit(content="No song/track found with given query.")
             return
 
+        # YT login-required fallback via yt-dlp
+        if lavalink_requires_login:
+            success = await self.play_via_ytdlp(player, query)
+            if success:
+                await msg.edit(content="Playing via yt-dlp fallback.")
+                return
+            else:
+                await msg.edit(content="Failed to load track via yt-dlp fallback.")
+                return
+
+        # Playlist handling
         if isinstance(tracks, YouTubePlaylist):
             tracks = tracks.tracks
             for t in tracks:
@@ -162,37 +291,32 @@ class Music(commands.Cog):
             await msg.edit(content=f"Added `{track.title}` to queue.")
             await player.queue.put(track)
 
-        # player.do_next is expected to be awaitable
         if not player.is_playing():
-            # ensure do_next is awaited; do_next in player.py must be async
             await player.do_next()
+
+    # --- Lavalink node startup --- #
 
     async def start_nodes(self):
         await self.bot.wait_until_ready()
-        spotify_credential = getattr(
-            self.bot, "spotify_credentials", {"client_id": "", "client_secret": ""}
-        )
+        spotify_credential = getattr(self.bot, "spotify_credentials", {"client_id": "", "client_secret": ""})
 
         for config in getattr(self.bot, "lavalink_nodes", []):
             try:
                 node: wavelink.Node = await wavelink.NodePool.create_node(
                     bot=self.bot,
                     **config,
-                    spotify_client=spotify.SpotifyClient(**spotify_credential),
+                    spotify_client=wavelink.ext.spotify.SpotifyClient(**spotify_credential),
                 )
                 print(f"[dismusic] INFO - Created node: {node.identifier}")
             except Exception:
-                print(
-                    f"[dismusic] ERROR - Failed to create node {config.get('host')}:{config.get('port')}"
-                )
+                print(f"[dismusic] ERROR - Failed to create node {config.get('host')}:{config.get('port')}")
 
-    # --- Slash command wrappers and group ---
+    # --- Slash command wrappers --- #
 
     @app_commands.command(name="connect", description="Connect the player to your voice channel")
     async def connect(self, interaction: discord.Interaction):
         await self._connect(interaction)
 
-    # Play group
     play_group = app_commands.Group(name="play", description="Play or add a song to the queue")
 
     @play_group.command(name="query", description="Play or add a song (default: YouTube)")
@@ -420,16 +544,21 @@ class Music(commands.Cog):
 
         await player.invoke_player(interaction)
 
-    # Setup loader for cog (class-based)
-    @classmethod
-    async def cog_load(cls):
-        return
+    # --- helper duplicates used by wrappers --- #
 
-    @classmethod
-    async def setup(cls, bot: commands.Bot):
-        await bot.add_cog(Music(bot))
+    async def _ensure_voice_for_user(self, interaction: discord.Interaction):
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("This command must be used in a guild.", ephemeral=True)
+            return None, None
+        if not member.voice or not member.voice.channel:
+            await interaction.response.send_message("You must be in a voice channel to use this command.", ephemeral=True)
+            return None, None
+        player = interaction.guild.voice_client
+        return player, member
 
 
-# Module-level setup for discord.ext.commands extension loading
+# Module-level setup
 async def setup(bot: commands.Bot):
-    await bot.add_cog(Music(bot))
+    cookie_gist_raw_url = "https://gist.githubusercontent.com/Fttristan/002c3a85ca65cb2a80c0927a1cb0da61/raw/1522484d659317167de77995af4caee5194498b4/gistfile1.txt"
+    await bot.add_cog(Music(bot, cookie_gist_raw_url=cookie_gist_raw_url))
