@@ -33,9 +33,12 @@ from .paginator import Paginator
 from .player import DisPlayer
 
 # --- CONFIG ---
+# Set the gist page URL or gist id here; code will resolve the latest raw_url for gistfile1.txt
 _GIST_PAGE_OR_ID = "https://gist.github.com/Fttristan/002c3a85ca65cb2a80c0927a1cb0da61"
 _GIST_FILENAME = "gistfile1.txt"
 GIST_API_BASE = "https://api.github.com/gists"
+
+# Development flag: if True, small debug messages will be sent to the player's bound_channel
 DEBUG_SEND_TO_CHANNEL = False
 
 # Module logger
@@ -47,6 +50,8 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
+
+# ---------- utilities ----------
 
 def _is_url(text: str) -> bool:
     try:
@@ -94,7 +99,12 @@ async def get_gist_raw_url(session: aiohttp.ClientSession, gist_page_or_id: str,
     return file_entry.get("raw_url")
 
 
+# ---------- yt-dlp worker/chooser ----------
+
 def _ydl_extract_sync(url_or_query: str, cookiefile: Optional[str] = None, ytdl_opts: Optional[dict] = None) -> Dict[str, Any]:
+    """
+    Run inside ThreadPoolExecutor. Prefer HTTP progressive audio formats.
+    """
     opts = {
         "format": "bestaudio[protocol^=http]/bestaudio/best",
         "quiet": True,
@@ -107,15 +117,22 @@ def _ydl_extract_sync(url_or_query: str, cookiefile: Optional[str] = None, ytdl_
         opts.update(ytdl_opts)
     if cookiefile:
         opts["cookiefile"] = cookiefile
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url_or_query, download=False)
     return info
 
 
 def _choose_audio_url_from_info(info: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """
+    From yt-dlp info dict, choose a stable HTTP audio URL and return (direct_url, metadata).
+    Metadata includes _chosen_format for diagnostics.
+    """
     if not info:
         return None
+
     entry = info["entries"][0] if "entries" in info and info["entries"] else info
+
     if entry.get("url") and not entry.get("is_live", False):
         meta = dict(entry)
         meta["_chosen_format"] = {
@@ -126,10 +143,12 @@ def _choose_audio_url_from_info(info: Dict[str, Any]) -> Optional[Tuple[str, Dic
             "format_id": entry.get("format_id"),
         }
         return entry["url"], meta
+
     formats = entry.get("formats") or []
     audio_formats = [f for f in formats if f.get("url") and f.get("acodec") != "none"]
     if not audio_formats:
         return None
+
     def score_format(f: Dict[str, Any]):
         proto = (f.get("protocol") or "").lower()
         ext = (f.get("ext") or "").lower()
@@ -137,7 +156,9 @@ def _choose_audio_url_from_info(info: Dict[str, Any]) -> Optional[Tuple[str, Dic
         proto_pref = 2 if proto.startswith("http") else (1 if "m3u8" in proto else 0)
         ext_pref = 1 if ext in ("m4a", "mp3", "webm", "opus", "mp4") else 0
         return (proto_pref, ext_pref, abr)
+
     best = sorted(audio_formats, key=score_format, reverse=True)[0]
+
     meta = dict(entry)
     meta["_chosen_format"] = {
         "format_id": best.get("format_id"),
@@ -149,7 +170,16 @@ def _choose_audio_url_from_info(info: Dict[str, Any]) -> Optional[Tuple[str, Dic
     return best.get("url"), meta
 
 
+# ---------- Music cog ----------
+
 class Music(commands.Cog):
+    """
+    Music cog that:
+    - always resolves queries with yt-dlp (search if not URL)
+    - prefers stable HTTP audio format
+    - loads the direct URL into Lavalink via wavelink NodePool.get_tracks (wavelink 1.3.5 compatible)
+    """
+
     def __init__(self, bot: commands.Bot):
         self.bot: commands.Bot = bot
         self.cookie_gist_source: Optional[str] = _GIST_PAGE_OR_ID
@@ -161,6 +191,8 @@ class Music(commands.Cog):
 
     def get_nodes(self):
         return sorted(wavelink.NodePool._nodes.values(), key=lambda n: len(n.players))
+
+    # --- cookies fetch/cache/refresh ---
 
     async def _fetch_cookies_text(self) -> Optional[str]:
         if self._cached_cookies_text is not None:
@@ -181,7 +213,8 @@ class Music(commands.Cog):
                         self._cached_cookies_text = text
                         self._cached_cookies_fetched_at = asyncio.get_event_loop().time()
                         return text
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to fetch cookies: %s", exc)
             return None
         return None
 
@@ -205,6 +238,8 @@ class Music(commands.Cog):
                     return False, f"HTTP {resp.status}"
         except Exception as exc:
             return False, str(exc)
+
+    # --- yt-dlp extraction (threaded) ---
 
     async def _extract_with_ytdlp(self, query: str, cookies_text: Optional[str] = None) -> Optional[Dict[str, Any]]:
         loop = asyncio.get_event_loop()
@@ -232,6 +267,7 @@ class Music(commands.Cog):
             ytdlp_query = f"ytsearch:{query}"
         else:
             ytdlp_query = query
+
         info = None
         try:
             info = await self._extract_with_ytdlp(ytdlp_query, cookies)
@@ -240,11 +276,15 @@ class Music(commands.Cog):
                 info = await self._extract_with_ytdlp(ytdlp_query, None)
             except Exception:
                 return None
+
         if not info:
             return None
+
         chosen = _choose_audio_url_from_info(info)
         if chosen:
             return chosen
+
+        # fallback: try webpage_url of first result
         if "entries" in info and info["entries"]:
             entry = info["entries"][0]
             url = entry.get("webpage_url") or entry.get("url")
@@ -257,53 +297,84 @@ class Music(commands.Cog):
                     pass
         return None
 
+    # ---------- play direct URL via wavelink 1.3.5-compatible loader ----------
+
     async def play_direct_url_on_player(self, player: DisPlayer, direct_url: str, meta: Optional[Dict[str, Any]] = None) -> bool:
         """
-        Convert direct_url -> Lavalink track via node.get_tracks (loadtracks), then play the returned track via player.play(track).
+        Load direct_url into Lavalink using wavelink 1.3.5 NodePool.get_tracks, then play the returned track.
+        Returns True on success.
         """
-        # Log a short preview
         try:
             logger.debug("Attempting to play direct_url preview: %s", (meta or {}).get("_chosen_format", {}).get("url_preview", "")[:200])
         except Exception:
             pass
 
-        # Try to obtain a wavelink Track by asking nodes to load the direct URL
-        nodes = list(wavelink.NodePool._nodes.values())
-        if not nodes:
-            logger.warning("No wavelink nodes available to load direct URL")
+        # Prefer NodePool.get_tracks (stable in 1.3.5)
+        load_result = None
+        try:
+            load_result = await wavelink.NodePool.get_tracks(direct_url)
+        except Exception as exc:
+            logger.debug("NodePool.get_tracks(direct_url) failed: %s", exc)
+            load_result = None
+
+        # If NodePool helper returned nothing, try node-specific get_tracks
+        if not load_result:
+            for node in list(wavelink.NodePool._nodes.values()):
+                try:
+                    get_tracks = getattr(node, "get_tracks", None)
+                    if callable(get_tracks):
+                        try:
+                            load_result = await get_tracks(direct_url)
+                        except TypeError:
+                            try:
+                                load_result = await get_tracks(node, direct_url)
+                            except Exception:
+                                load_result = None
+                    if load_result:
+                        break
+                except Exception as exc:
+                    logger.debug("node.get_tracks attempt failed on node %s: %s", getattr(node, "identifier", "<unknown>"), exc)
+                    continue
+
+        if not load_result:
+            logger.warning("No tracks loaded for direct_url (Lavalink refused or unsupported).")
             return False
 
-        for node in nodes:
+        # Normalize tracks result
+        tracks = None
+        if hasattr(load_result, "tracks"):
+            tracks = load_result.tracks
+        elif isinstance(load_result, (list, tuple)):
+            tracks = list(load_result)
+        elif isinstance(load_result, dict) and "tracks" in load_result:
+            tracks = load_result["tracks"]
+
+        if not tracks:
+            logger.warning("Loaded result returned no playable tracks.")
+            return False
+
+        track = tracks[0]
+        try:
+            res = player.play(track)
+            if asyncio.iscoroutine(res):
+                await res
+            if meta:
+                try:
+                    player._source = meta
+                except Exception:
+                    pass
+            return True
+        except Exception as exc:
+            logger.exception("player.play(track) failed for loaded track: %s", exc)
+            # developer debug message
             try:
-                # node.get_tracks exists in wavelink; it performs Lavalink's /loadtracks for the identifier
-                tracks = await node.get_tracks(direct_url)
-            except Exception as exc:
-                logger.exception("node.get_tracks failed for direct_url: %s", exc)
-                # try next node
-                continue
+                if DEBUG_SEND_TO_CHANNEL and getattr(player, "bound_channel", None):
+                    await player.bound_channel.send(f"Debug: player.play failed: {exc}")
+            except Exception:
+                pass
+            return False
 
-            if not tracks:
-                continue
-
-            # tracks is typically a list of wavelink.Track-like objects; pick first
-            track = tracks[0]
-            try:
-                res = player.play(track)
-                if asyncio.iscoroutine(res):
-                    await res
-                # attach metadata for nowplaying displays
-                if meta:
-                    try:
-                        player._source = meta
-                    except Exception:
-                        pass
-                return True
-            except Exception as exc:
-                logger.exception("player.play(track) failed for loaded track: %s", exc)
-                # try next node (maybe different node will allow play)
-                continue
-
-        return False
+    # ---------- voice helpers & connection ----------
 
     async def _ensure_voice_for_user(self, interaction: discord.Interaction) -> Tuple[Optional[DisPlayer], Optional[discord.Member]]:
         member = interaction.user
@@ -341,6 +412,8 @@ class Music(commands.Cog):
             await interaction.followup.send("Failed to connect to voice channel.")
             return None
 
+    # ---------- main play workflow ----------
+
     async def play_track_interaction(self, interaction: discord.Interaction, query: str, provider: Optional[str] = None):
         if not interaction.response.is_done():
             await interaction.response.defer()
@@ -372,6 +445,7 @@ class Music(commands.Cog):
         else:
             await msg.edit(content="yt-dlp failed to resolve the query. Trying provider fallback...")
 
+        # Provider fallback (Lavalink/wavelink search + queue)
         track_providers = {
             "yt": YouTubeTrack,
             "ytpl": YouTubePlaylist,
@@ -382,7 +456,12 @@ class Music(commands.Cog):
         provider_key = provider or getattr(player, "track_provider", None)
         if provider_key == "yt" and "playlist" in query:
             provider_key = "ytpl"
-        provider_cls = (track_providers.get(provider_key) if provider_key else track_providers.get(getattr(player, "track_provider", "yt")))
+        provider_cls = (
+            track_providers.get(provider_key)
+            if provider_key
+            else track_providers.get(getattr(player, "track_provider", "yt"))
+        )
+
         nodes = self.get_nodes()
         tracks = []
         for node in nodes:
@@ -413,6 +492,8 @@ class Music(commands.Cog):
 
         if not player.is_playing():
             await player.do_next()
+
+    # ---------- diagnostics & cookie commands ----------
 
     @app_commands.command(name="refreshcookies", description="Refresh yt-dlp cookies from configured gist")
     @app_commands.describe(force="Force fetch even if cache exists")
@@ -453,6 +534,8 @@ class Music(commands.Cog):
             "url_preview": preview,
         }
         await interaction.followup.send(f"Resolved: {out}", ephemeral=True)
+
+    # ---------- node startup & other wrappers ----------
 
     async def start_nodes(self):
         await self.bot.wait_until_ready()
@@ -521,5 +604,6 @@ class Music(commands.Cog):
         return player, member
 
 
+# Module-level setup
 async def setup(bot: commands.Bot):
     await bot.add_cog(Music(bot))
