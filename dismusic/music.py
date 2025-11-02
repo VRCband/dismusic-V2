@@ -3,6 +3,7 @@ import asyncio
 import tempfile
 import os
 import re
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple, Dict, Any
 from urllib.parse import urlparse
@@ -38,6 +39,16 @@ GIST_API_BASE = "https://api.github.com/gists"
 
 # Optional: set to True to send short debug messages to bound_channel on failures (development)
 DEBUG_SEND_TO_CHANNEL = False
+
+# Module logger
+logger = logging.getLogger("dismusic")
+if not logger.handlers:
+    # Basic fallback handler if the host didn't configure logging
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 
 # ---------- helpers ----------
@@ -299,8 +310,6 @@ class Music(commands.Cog):
         for playback of raw HTTP stream URLs. Returns True on success.
         """
         try:
-            # Node.play signature: node.play(guild_id/player_id, track) varies by wavelink versions.
-            # Common working call: await node.play(player.player_id, direct_url)
             await node.play(player.player_id, direct_url)
             if meta:
                 try:
@@ -309,7 +318,7 @@ class Music(commands.Cog):
                     pass
             return True
         except Exception as exc:
-            self.bot.logger.exception("node.play failed for direct URL")
+            logger.exception("node.play failed for direct URL: %s", exc)
             try:
                 if DEBUG_SEND_TO_CHANNEL and getattr(player, "bound_channel", None):
                     await player.bound_channel.send(f"Debug: node.play failed: {exc}")
@@ -324,7 +333,7 @@ class Music(commands.Cog):
         """
         # debug log the chosen format metadata if present
         try:
-            self.bot.logger.debug("Attempting to play direct_url preview: %s", (meta or {}).get("_chosen_format", {}).get("url_preview", "")[:200])
+            logger.debug("Attempting to play direct_url preview: %s", (meta or {}).get("_chosen_format", {}).get("url_preview", "")[:200])
         except Exception:
             pass
 
@@ -340,7 +349,7 @@ class Music(commands.Cog):
                     pass
             return True
         except Exception as exc:
-            self.bot.logger.exception("player.play direct_url failed")
+            logger.exception("player.play direct_url failed: %s", exc)
             if DEBUG_SEND_TO_CHANNEL and getattr(player, "bound_channel", None):
                 try:
                     await player.bound_channel.send(f"Debug: player.play failed: {exc}")
@@ -350,10 +359,9 @@ class Music(commands.Cog):
         # Fallback to node.play on any available node
         nodes = list(wavelink.NodePool._nodes.values())
         if not nodes:
-            self.bot.logger.warning("No wavelink nodes available for node.play fallback")
+            logger.warning("No wavelink nodes available for node.play fallback")
             return False
 
-        # try nodes in order
         for node in nodes:
             ok = await self._play_direct_url_via_node(node, player, direct_url, meta)
             if ok:
@@ -390,6 +398,7 @@ class Music(commands.Cog):
             await interaction.response.defer()
         try:
             player: DisPlayer = await channel.connect(cls=DisPlayer)
+            # dispatch but don't rely on bot.logger
             self.bot.dispatch("dismusic_player_connect", player)
             player.bound_channel = interaction.channel
             player.bot = self.bot
@@ -423,7 +432,7 @@ class Music(commands.Cog):
         if resolved:
             direct_url, meta = resolved
             # store chosen-format preview in log for debugging
-            self.bot.logger.info("yt-dlp resolved direct_url (preview) %s", meta.get("_chosen_format", {}).get("url_preview", "")[:200])
+            logger.info("yt-dlp resolved direct_url (preview) %s", meta.get("_chosen_format", {}).get("url_preview", "")[:200])
             ok = await self.play_direct_url_on_player(player, direct_url, meta)
             if ok:
                 await msg.edit(content=f"Playing `{meta.get('title') or query}` (resolved via yt-dlp).")
@@ -537,9 +546,10 @@ class Music(commands.Cog):
                     **config,
                     spotify_client=wavelink.ext.spotify.SpotifyClient(**spotify_credential),
                 )
-                self.bot.logger.info("Created node: %s", node.identifier)
+                logger.info("Created node: %s", node.identifier)
             except Exception:
-                self.bot.logger.exception("Failed to create node %s:%s", config.get("host"), config.get("port"))
+                # log exception safely even if bot lacks a logger attribute
+                logger.exception("Failed to create node %s:%s", config.get("host"), config.get("port"))
 
     @app_commands.command(name="connect", description="Connect the player to your voice channel")
     async def connect(self, interaction: discord.Interaction):
