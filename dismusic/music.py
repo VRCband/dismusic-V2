@@ -29,7 +29,7 @@ from .paginator import Paginator
 from .player import DisPlayer
 
 
-# --- yt-dlp helpers (sync worker + chooser) ---
+# ---------- yt-dlp helpers (sync worker + chooser) ----------
 
 
 def _ydl_extract_sync(url_or_query: str, cookiefile: Optional[str] = None, ytdl_opts: Optional[dict] = None) -> Dict:
@@ -61,7 +61,7 @@ def _choose_audio_url_from_info(info: Dict) -> Optional[Tuple[str, Dict]]:
     else:
         entry = info
 
-    # direct 'url' present and not a live stream
+    # If entry has direct 'url' and is not live, prefer it
     if entry.get("url") and not entry.get("is_live", False):
         return entry["url"], entry
 
@@ -74,39 +74,62 @@ def _choose_audio_url_from_info(info: Dict) -> Optional[Tuple[str, Dict]]:
     return best.get("url"), entry
 
 
-# --- Music cog ---
+# ---------- Music cog ----------
 
 
 class Music(commands.Cog):
     """
-    Music cog with:
-    - guarded interaction.defer usage
-    - yt-dlp fallback using cookie gist raw URL (provided at setup)
-    - robust Lavalink node handling and async-timeout fixes
+    Music cog that always resolves YouTube tracks with yt-dlp.
+    - Uses gist raw URL (or config) for cookies; cached in-memory with refresh command.
+    - All YouTube (provider 'yt'/'ytmusic' or queries/URLs containing youtube) are resolved with yt-dlp before play/queue.
     """
 
     def __init__(self, bot: commands.Bot, *, cookie_gist_raw_url: Optional[str] = None):
         self.bot: commands.Bot = bot
         self.cookie_gist_raw_url = cookie_gist_raw_url
-        self.bot.loop.create_task(self.start_nodes())
+        self._cached_cookies_text: Optional[str] = None
+        self._cached_cookies_fetched_at: Optional[float] = None
         self._ydl_executor = ThreadPoolExecutor(max_workers=2)
+        self.bot.loop.create_task(self.start_nodes())
 
     def get_nodes(self):
         return sorted(wavelink.NodePool._nodes.values(), key=lambda n: len(n.players))
 
-    # --- cookie fetching / yt-dlp extraction ---
+    # ---------- cookie fetching / caching / refresh ----------
 
     async def _fetch_cookies_text(self) -> Optional[str]:
+        if self._cached_cookies_text is not None:
+            return self._cached_cookies_text
         if not self.cookie_gist_raw_url:
             return None
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(self.cookie_gist_raw_url, timeout=10) as resp:
                     if resp.status == 200:
-                        return await resp.text()
+                        text = await resp.text()
+                        self._cached_cookies_text = text
+                        self._cached_cookies_fetched_at = asyncio.get_event_loop().time()
+                        return text
         except Exception:
             return None
         return None
+
+    async def _refresh_cookies(self) -> Tuple[bool, Optional[str]]:
+        if not self.cookie_gist_raw_url:
+            return False, "No cookie raw URL configured"
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(self.cookie_gist_raw_url, timeout=10) as resp:
+                    if resp.status == 200:
+                        text = await resp.text()
+                        self._cached_cookies_text = text
+                        self._cached_cookies_fetched_at = asyncio.get_event_loop().time()
+                        return True, None
+                    return False, f"HTTP {resp.status}"
+        except Exception as exc:
+            return False, str(exc)
+
+    # ---------- yt-dlp extraction (runs in thread) ----------
 
     async def _extract_with_ytdlp(self, query: str, cookies_text: Optional[str] = None) -> Optional[Dict]:
         loop = asyncio.get_event_loop()
@@ -128,6 +151,32 @@ class Music(commands.Cog):
                 except Exception:
                     pass
 
+    async def play_direct_url_on_player(self, player: DisPlayer, direct_url: str, meta: Optional[Dict] = None) -> bool:
+        # Try to play URL with player.play; handle both coroutine and sync variants and fallback to node.play
+        try:
+            res = player.play(direct_url)
+            if asyncio.iscoroutine(res):
+                await res
+            # attach metadata for now-playing display
+            if meta:
+                try:
+                    player._source = meta
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            try:
+                node = next(iter(wavelink.NodePool._nodes.values()))
+                await node.play(player.player_id, direct_url)
+                if meta:
+                    try:
+                        player._source = meta
+                    except Exception:
+                        pass
+                return True
+            except Exception:
+                return False
+
     async def play_via_ytdlp(self, player: DisPlayer, query: str) -> bool:
         cookies_text = await self._fetch_cookies_text()
         try:
@@ -140,41 +189,18 @@ class Music(commands.Cog):
             return False
 
         direct_url, meta = chosen
+        return await self.play_direct_url_on_player(player, direct_url, meta)
 
-        # Try to play direct URL via player.play (wavelink handles HTTP streams)
-        try:
-            res = player.play(direct_url)
-            if asyncio.iscoroutine(res):
-                await res
-        except Exception:
-            # Fallback: node.play if API/version requires it
-            try:
-                node = next(iter(wavelink.NodePool._nodes.values()))
-                await node.play(player.player_id, direct_url)
-            except Exception:
-                return False
-
-        # Attach metadata for now-playing display
-        try:
-            player._source = meta
-        except Exception:
-            pass
-
-        return True
-
-    # --- internal helpers for interactions/voice checks ---
+    # ---------- voice checks and connect ----------
 
     async def _ensure_voice_for_user(self, interaction: discord.Interaction) -> Tuple[Optional[DisPlayer], Optional[discord.Member]]:
         member = interaction.user
         if not isinstance(member, discord.Member):
             await interaction.response.send_message("This command must be used in a guild.", ephemeral=True)
             return None, None
-
-        vc = member.voice
-        if not vc:
+        if not member.voice or not member.voice.channel:
             await interaction.response.send_message("You must be in a voice channel to use this command.", ephemeral=True)
             return None, None
-
         player = interaction.guild.voice_client
         return player, member
 
@@ -207,7 +233,11 @@ class Music(commands.Cog):
             await interaction.followup.send("Failed to connect to voice channel.")
             return None
 
-    # --- main play workflow with fallback --- #
+    # ---------- main play workflow: ALWAYS resolve YouTube via yt-dlp ----------
+
+    def _is_youtube_query(self, query: str) -> bool:
+        q = (query or "").lower()
+        return "youtube.com" in q or "youtu.be" in q or q.startswith("ytsearch:") or "youtube" in q and q.split()  # allow broader matching
 
     async def play_track_interaction(self, interaction: discord.Interaction, query: str, provider: Optional[str] = None):
         # Defer only if not already responded
@@ -219,12 +249,34 @@ class Music(commands.Cog):
             await interaction.followup.send("Player is not connected. Use /connect first.")
             return
 
-        # Ensure same voice channel
         member = interaction.user
         if member.voice is None or member.voice.channel.id != player.channel.id:
             await interaction.followup.send("You must be in the same voice channel as the player.", ephemeral=True)
             return
 
+        query = query.strip("<>")
+
+        # initial user-facing message
+        msg = await interaction.followup.send(f"Resolving `{query}` with yt-dlp :mag_right:")
+
+        # If provider indicates YouTube or query looks like YouTube, always use yt-dlp
+        provider_key = provider or getattr(player, "track_provider", None)
+        use_ytdlp = False
+        if provider_key in ("yt", "ytmusic"):
+            use_ytdlp = True
+        elif self._is_youtube_query(query):
+            use_ytdlp = True
+
+        if use_ytdlp:
+            # Use yt-dlp to resolve stream URL / metadata
+            ok = await self.play_via_ytdlp(player, query)
+            if ok:
+                await msg.edit(content=f"Playing `{query}` (resolved via yt-dlp).")
+                return
+            # if yt-dlp failed, fall back to normal provider search/queue as a safety net
+            await msg.edit(content="yt-dlp resolution failed, falling back to provider search...")
+
+        # fallback: provider search via nodes for non-YouTube or if yt-dlp failed
         track_providers = {
             "yt": YouTubeTrack,
             "ytpl": YouTubePlaylist,
@@ -233,23 +285,18 @@ class Music(commands.Cog):
             "spotify": SpotifyTrack,
         }
 
-        query = query.strip("<>")
-        msg = await interaction.followup.send(f"Searching for `{query}` :mag_right:")
-
-        track_provider_key = provider if provider else getattr(player, "track_provider", None)
-        if track_provider_key == "yt" and "playlist" in query:
-            track_provider_key = "ytpl"
+        # detect playlist url-ish
+        if provider_key == "yt" and "playlist" in query:
+            provider_key = "ytpl"
 
         provider_cls = (
-            track_providers.get(track_provider_key)
-            if track_provider_key
+            track_providers.get(provider_key)
+            if provider_key
             else track_providers.get(getattr(player, "track_provider", "yt"))
         )
 
         nodes = self.get_nodes()
         tracks = []
-
-        lavalink_requires_login = False
         for node in nodes:
             try:
                 async with async_timeout.timeout(20):
@@ -259,28 +306,13 @@ class Music(commands.Cog):
                 self.bot.dispatch("dismusic_node_fail", node)
                 wavelink.NodePool._nodes.pop(node.identifier, None)
                 continue
-            except (LavalinkException, LoadTrackError) as e:
-                txt = str(e).lower()
-                if "login" in txt or "requires login" in txt or "private" in txt:
-                    lavalink_requires_login = True
-                    break
+            except (LavalinkException, LoadTrackError):
                 continue
 
-        if not tracks and not lavalink_requires_login:
+        if not tracks:
             await msg.edit(content="No song/track found with given query.")
             return
 
-        # YT login-required fallback via yt-dlp
-        if lavalink_requires_login:
-            success = await self.play_via_ytdlp(player, query)
-            if success:
-                await msg.edit(content="Playing via yt-dlp fallback.")
-                return
-            else:
-                await msg.edit(content="Failed to load track via yt-dlp fallback.")
-                return
-
-        # Playlist handling
         if isinstance(tracks, YouTubePlaylist):
             tracks = tracks.tracks
             for t in tracks:
@@ -294,7 +326,7 @@ class Music(commands.Cog):
         if not player.is_playing():
             await player.do_next()
 
-    # --- Lavalink node startup --- #
+    # ---------- Lavalink node startup ----------
 
     async def start_nodes(self):
         await self.bot.wait_until_ready()
@@ -311,7 +343,7 @@ class Music(commands.Cog):
             except Exception:
                 print(f"[dismusic] ERROR - Failed to create node {config.get('host')}:{config.get('port')}")
 
-    # --- Slash command wrappers --- #
+    # ---------- Slash command wrappers (complete) ----------
 
     @app_commands.command(name="connect", description="Connect the player to your voice channel")
     async def connect(self, interaction: discord.Interaction):
@@ -331,7 +363,7 @@ class Music(commands.Cog):
                 return
         await self.play_track_interaction(interaction, query, provider=None)
 
-    @play_group.command(name="youtube", description="Play a YouTube track")
+    @play_group.command(name="youtube", description="Play a YouTube track (always resolved with yt-dlp)")
     @app_commands.describe(query="Search query or URL")
     async def youtube(self, interaction: discord.Interaction, query: str):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -343,7 +375,7 @@ class Music(commands.Cog):
                 return
         await self.play_track_interaction(interaction, query, provider="yt")
 
-    @play_group.command(name="ytmusic", description="Play a YouTube Music track")
+    @play_group.command(name="ytmusic", description="Play a YouTube Music track (resolved with yt-dlp)")
     @app_commands.describe(query="Search query or URL")
     async def youtubemusic(self, interaction: discord.Interaction, query: str):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -379,6 +411,7 @@ class Music(commands.Cog):
                 return
         await self.play_track_interaction(interaction, query, provider="spotify")
 
+    # Volume
     @app_commands.command(name="volume", description="Set player volume (0-100)")
     @app_commands.describe(vol="Volume percent (0-100)", forced="Force volume greater than 100")
     async def volume(self, interaction: discord.Interaction, vol: int, forced: bool = False):
@@ -402,6 +435,7 @@ class Music(commands.Cog):
         await player.set_volume(vol)
         await interaction.response.send_message(f"Volume set to {vol} :loud_sound:")
 
+    # Stop / disconnect
     @app_commands.command(name="stop", description="Stop and disconnect the player")
     async def stop(self, interaction: discord.Interaction):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -417,6 +451,7 @@ class Music(commands.Cog):
         await interaction.response.send_message("Stopped the player :stop_button:")
         self.bot.dispatch("dismusic_player_stop", player)
 
+    # Pause
     @app_commands.command(name="pause", description="Pause the player")
     async def pause(self, interaction: discord.Interaction):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -436,6 +471,7 @@ class Music(commands.Cog):
 
         await interaction.response.send_message("Player is not playing anything.", ephemeral=True)
 
+    # Resume
     @app_commands.command(name="resume", description="Resume the player")
     async def resume(self, interaction: discord.Interaction):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -455,6 +491,7 @@ class Music(commands.Cog):
 
         await interaction.response.send_message("Player is not playing anything.", ephemeral=True)
 
+    # Skip
     @app_commands.command(name="skip", description="Skip to the next song in the queue")
     async def skip(self, interaction: discord.Interaction):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -473,6 +510,7 @@ class Music(commands.Cog):
         self.bot.dispatch("dismusic_track_skip", player)
         await interaction.response.send_message("Skipped :track_next:")
 
+    # Seek (seconds)
     @app_commands.command(name="seek", description="Seek the player forward/backward by seconds")
     @app_commands.describe(seconds="Seconds to advance (positive) or rewind (negative)")
     async def seek(self, interaction: discord.Interaction, seconds: int):
@@ -499,6 +537,7 @@ class Music(commands.Cog):
 
         await interaction.response.send_message("Player is not playing anything.", ephemeral=True)
 
+    # Loop
     @app_commands.command(name="loop", description="Set loop mode: NONE, CURRENT, PLAYLIST")
     @app_commands.describe(loop_type="NONE, CURRENT, or PLAYLIST")
     async def loop(self, interaction: discord.Interaction, loop_type: str = None):
@@ -514,6 +553,7 @@ class Music(commands.Cog):
         result = await player.set_loop(loop_type)
         await interaction.response.send_message(f"Loop has been set to {result} :repeat:")
 
+    # Queue (uses paginator)
     @app_commands.command(name="queue", description="Show the player queue")
     async def queue(self, interaction: discord.Interaction):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -531,6 +571,7 @@ class Music(commands.Cog):
         paginator = Paginator(interaction, player)
         await paginator.start()
 
+    # Now playing
     @app_commands.command(name="nowplaying", description="Show the currently playing song")
     async def nowplaying(self, interaction: discord.Interaction):
         player, member = await self._ensure_voice_for_user(interaction)
@@ -544,7 +585,30 @@ class Music(commands.Cog):
 
         await player.invoke_player(interaction)
 
-    # --- helper duplicates used by wrappers --- #
+    # ---------- refresh cookies command ----------
+
+    @app_commands.command(name="refreshcookies", description="Refresh yt-dlp cookies from configured raw URL")
+    @app_commands.describe(force="Force fetch even if cache exists")
+    async def refreshcookies(self, interaction: discord.Interaction, force: bool = False):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
+        if not self.cookie_gist_raw_url:
+            await interaction.followup.send("No cookie raw URL is configured for this bot.", ephemeral=True)
+            return
+
+        if self._cached_cookies_text and not force:
+            ts = self._cached_cookies_fetched_at or 0
+            await interaction.followup.send(f"Cookies already cached (fetched at {ts}). Use force=True to re-fetch.", ephemeral=True)
+            return
+
+        success, err = await self._refresh_cookies()
+        if success:
+            await interaction.followup.send("Cookies refreshed and cached in memory.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Failed to refresh cookies: {err}", ephemeral=True)
+
+    # ---------- helper duplicate used by wrappers ----------
 
     async def _ensure_voice_for_user(self, interaction: discord.Interaction):
         member = interaction.user
